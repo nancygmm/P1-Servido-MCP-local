@@ -15,6 +15,43 @@ from mcp.client.stdio import stdio_client
 
 load_dotenv()
 
+import textwrap
+
+ORCHESTRATOR_SYS = """Eres un planificador que transforma la petición del usuario en UNA acción.
+Responde SOLO un JSON válido y nada más, sin texto adicional.
+Si la intención no coincide con las herramientas, responde {"tool":"chat","args":{"prompt":"<texto para el LLM>"}}
+
+Herramientas permitidas (tool):
+- "qr.generate_url": args = { "url": string, "filename": optional string }
+- "qr.generate_text": args = { "text": string, "filename": optional string }
+- "qr.generate_wifi": args = { "ssid": string, "password": string or "", "auth": "WPA"|"WEP"|"NOPASS", "hidden": boolean, "filename": optional string }
+- "qr.generate_vcard": args = { "full_name": string, "org": optional string, "title": optional string, "phone": optional string, "email": optional string, "url": optional string, "filename": optional string }
+- "qr.decode_image": args = { "image_path": string }
+- "external.call": args = { "server": "EXT1"|"EXT2", "tool": string, "args": object }
+
+Reglas:
+- Si el usuario pega una URL, asume "qr.generate_url".
+- Si menciona WiFi/SSID/contraseña, usa "qr.generate_wifi". Si dice que no hay contraseña, usa auth="NOPASS" y password="".
+- Si pide "tarjeta de contacto"/"vcard"/"contacto", usa "qr.generate_vcard".
+- Si dice "texto", "mensaje", "todo lo que dice", usa "qr.generate_text".
+- Si pide leer/decodificar un QR de una imagen, usa "qr.decode_image".
+- Si pide usar un servidor de un compañero, usa "external.call" con el server y tool adecuados.
+- Si suena a conversación general, usa "chat".
+- Si el usuario sugiere un nombre de archivo, ponlo en filename."""
+
+def ask_fn_with_sys(ask_fn, system: str, user: str) -> str:
+    composite = textwrap.dedent(f"[SYSTEM]\n{system}\n\n[USER]\n{user}")
+    return ask_fn(composite)
+
+def plan_action_with_llm(ask_fn, user_text: str) -> dict:
+    prompt = f"Convierte el siguiente pedido del usuario en una acción JSON:\n---\n{user_text}\n---\nResponde SOLO JSON:"
+    raw = ask_fn_with_sys(ask_fn, ORCHESTRATOR_SYS, prompt)
+    m = re.search(r'\{.*\}', raw, flags=re.S)
+    try:
+        return json.loads(m.group(0)) if m else {"tool":"chat","args":{"prompt":user_text}}
+    except Exception:
+        return {"tool":"chat","args":{"prompt":user_text}}
+    
 
 class ChatbotMCP:
     def __init__(self, api_key: str, model: str = "claude-3-haiku-20240307"):
@@ -29,6 +66,15 @@ class ChatbotMCP:
         self.git_args = os.getenv("MCP_GIT_ARGS", "mcp-server-git").split()
 
         os.makedirs(self.fs_root, exist_ok=True)
+        
+        self.ext_map = {}
+        for key in ("EXT1","EXT2"):
+            cmd = os.getenv(f"{key}_CMD", "").strip()
+            args = os.getenv(f"{key}_ARGS", "").strip()
+            label = os.getenv(f"{key}_LABEL", key).strip() or key
+            if cmd and args:
+                self.ext_map[label] = {"cmd": cmd, "args": args.split()}
+
 
     def ask_llm(self, prompt: str) -> str:
         messages = self.history + [{"role": "user", "content": prompt}]
@@ -145,6 +191,12 @@ class ChatbotMCP:
     async def _with_qr(self):
         return await self._connect_session(command="python", args=[self.qr_server_path])
 
+    async def _with_external(self, label: str):
+        if label not in self.ext_map:
+            raise RuntimeError(f"Servidor externo no configurado: {label}")
+        cfg = self.ext_map[label]
+        return await self._connect_session(command=cfg["cmd"], args=cfg["args"])
+
     def demo_git_repo(self, repo_path: str) -> str:
         repo_abs = os.path.abspath(repo_path)
         readme_path = os.path.join(repo_abs, "README.md")
@@ -222,22 +274,37 @@ class ChatbotMCP:
             await stack.aclose()
             return result
         return asyncio.run(run())
+    
+    def external_call(self, server_label: str, tool_name: str, arguments: dict) -> str:
+        async def run():
+            session, stack = await self._with_external(server_label)
+            result = await self._call_tool_text(session, f"MCP:{server_label}", tool_name, arguments or {})
+            await stack.aclose()
+            return result
+        return asyncio.run(run())
 
-def print_help():
-    print("""
-Comandos:
-  demo_git <ruta_repo>
-  qr_url <url> [filename.png]
-  qr_text "<texto>" [filename.png]
-  qr_wifi "<ssid>" "<password>" [WPA|WEP|nopass] [hidden=true|false]
-  qr_vcard "<nombre>" [--org "UVG"] [--title "Estudiante"] [--phone "+502..."] [--email "a@b"] [--url "https://..."] [filename.png]
-  qr_decode <ruta_imagen.png>
-  log
-  salir | exit | quit
-
-(Escribe cualquier otra cosa para preguntarle al LLM)
-""")
-
+    
+    def dispatch_nl_action(self, plan: dict) -> str:
+        tool = (plan.get("tool") or "").strip()
+        args = plan.get("args") or {}
+        try:
+            if tool == "qr.generate_url":
+                return self.qr_generate_url(args["url"], args.get("filename"))
+            if tool == "qr.generate_text":
+                return self.qr_generate_text(args["text"], args.get("filename"))
+            if tool == "qr.generate_wifi":
+                return self.qr_generate_wifi(args["ssid"], args.get("password",""), args.get("auth","WPA"), bool(args.get("hidden", False)), args.get("filename"))
+            if tool == "qr.generate_vcard":
+                return self.qr_generate_vcard(**args)
+            if tool == "qr.decode_image":
+                return self.qr_decode(args["image_path"])
+            if tool == "external.call":
+                return self.external_call(args["server"], args["tool"], args.get("args", {}))
+            if tool == "chat":
+                return self.ask_llm(args.get("prompt",""))
+        except Exception as e:
+            return f"Error ejecutando {tool}: {e}"
+        return self.ask_llm(args.get("prompt",""))
 
 def parse_bool(s: str) -> bool:
     return str(s).lower() in ("1", "true", "t", "yes", "y", "si", "sí")
@@ -249,8 +316,7 @@ if __name__ == "__main__":
         raise SystemExit("Falta ANTHROPIC_API_KEY en el entorno. Exporta la variable y vuelve a ejecutar.")
 
     bot = ChatbotMCP(api_key=api_key, model="claude-3-haiku-20240307")
-    print("Escribe tu pregunta o un comando. Escribe 'help' para ayuda.")
-    print_help()
+    print("Escribe tu pregunta :)")
 
     try:
         while True:
@@ -259,8 +325,6 @@ if __name__ == "__main__":
             if not user_in:
                 continue
 
-            if user_in.lower() in ("help", "?"):
-                print_help(); continue
             if user_in.lower() in ("salir", "exit", "quit"):
                 break
             if user_in.lower() == "log":
@@ -346,7 +410,10 @@ if __name__ == "__main__":
                     print(bot.qr_decode(image_path))
                     continue
 
-                print("Bot:", bot.ask_llm(user_in))
+                plan = plan_action_with_llm(bot.ask_llm, user_in)
+                out = bot.dispatch_nl_action(plan)
+                print("Bot:", out)
+
             except Exception as e:
                 print("Error procesando comando:", e)
     except KeyboardInterrupt:
