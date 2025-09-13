@@ -1,7 +1,8 @@
-FROM python:3.11-slim
+FROM node:20-bookworm-slim
 WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-COPY server_remote_time_mcp.py .
-ENV PORT=8080
-CMD ["python", "server_remote_time_mcp.py"]
+COPY package*.json ./
+RUN npm ci --omit=dev
+COPY . .
+ENV NODE_ENV=production
+EXPOSE 8080
+CMD ["node","server.js"]

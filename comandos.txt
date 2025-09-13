@@ -1,0 +1,2 @@
+export MCP_REMOTE_URL="wss://remote-time-mcp-245568707216.us-central1.run.app/mcp"
+python chatbot.py
