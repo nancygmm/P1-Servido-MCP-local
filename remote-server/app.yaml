@@ -1,0 +1,11 @@
+runtime: python311
+
+entrypoint: python server_remote_time_mcp.py
+
+env_variables:
+  MCP_ENV: production
+  TZ: UTC
+
+automatic_scaling:
+  min_instances: 0
+  max_instances: 1
