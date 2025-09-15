@@ -1,11 +1,10 @@
 runtime: python311
-
-entrypoint: python server_remote_time_mcp.py
+service: default
+entrypoint: gunicorn -b :$PORT server_remote_time_mcp:app
 
 env_variables:
-  MCP_ENV: production
   TZ: UTC
 
 automatic_scaling:
-  min_instances: 0
+  min_instances: 1
   max_instances: 1

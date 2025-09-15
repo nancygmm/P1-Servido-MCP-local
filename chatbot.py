@@ -6,6 +6,8 @@ import requests
 from datetime import datetime
 from contextlib import AsyncExitStack
 from dotenv import load_dotenv
+import uuid
+
 
 ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_VERSION = "2023-06-01"
@@ -28,6 +30,7 @@ Herramientas permitidas (tool):
 - "qr.generate_vcard": args = { "full_name": string, "org": optional string, "title": optional string, "phone": optional string, "email": optional string, "url": optional string, "filename": optional string }
 - "qr.decode_image": args = { "image_path": string }
 - "external.call": args = { "server": "EXT1"|"EXT2", "tool": string, "args": object }
+- "temp.convert": args = { "value": float, "unit": "C"|"F" }
 
 Reglas:
 - Si el usuario pega una URL, asume "qr.generate_url".
@@ -36,6 +39,7 @@ Reglas:
 - Si dice "texto", "mensaje", "todo lo que dice", usa "qr.generate_text".
 - Si pide leer/decodificar un QR de una imagen, usa "qr.decode_image".
 - Si pide usar un servidor de un compañero, usa "external.call" con el server y tool adecuados.
+- Si pide convertir temperatura, usar Celsius/Fahrenheit, usa "temp.convert" con value (número) y unit ("C" o "F").
 - Si suena a conversación general, usa "chat".
 - Si el usuario sugiere un nombre de archivo, ponlo en filename."""
 
@@ -62,8 +66,11 @@ class ChatbotMCP:
 
         self.fs_root = os.getenv("MCP_FS_ROOT", os.path.abspath("./workspace"))
         self.qr_server_path = os.getenv("QR_MCP_PATH", os.path.abspath("./mcp-qr/server_qr_mcp.py"))
-        self.git_command = os.getenv("MCP_GIT_CMD", "uvx")   # alternativo: "python"
+        self.git_command = os.getenv("MCP_GIT_CMD", "uvx")  
         self.git_args = os.getenv("MCP_GIT_ARGS", "mcp-server-git").split()
+        
+        self.temp_server_url = os.getenv("TEMP_MCP_URL", "http://localhost:8080")
+        print(self.temp_server_url)
 
         os.makedirs(self.fs_root, exist_ok=True)
         
@@ -158,6 +165,39 @@ class ChatbotMCP:
             msg = f"ERROR llamando {tool_name}: {e}"
             self._log(server_label, f"{tool_name} {json.dumps(arguments)}", msg, error=True)
             return msg
+
+    def _call_remote_tool(self, server_url: str, server_label: str, tool_name: str, arguments: dict) -> str:
+        try:
+            url = f"{server_url}/tools/{tool_name}/call"
+            
+            payload = {
+                "arguments": arguments
+            }
+            
+            headers = {
+                "Content-Type": "application/json"
+            }
+            
+            response = requests.post(url, json=payload, headers=headers, timeout=30)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if "content" in data and data["content"]:
+                    result_text = data["content"][0].get("text", str(data))
+                else:
+                    result_text = str(data)
+                
+                self._log(server_label, f"{tool_name} {json.dumps(arguments)}", result_text)
+                return result_text
+            else:
+                error_msg = f"Error HTTP {response.status_code}: {response.text}"
+                self._log(server_label, f"{tool_name} {json.dumps(arguments)}", error_msg, error=True)
+                return error_msg
+                
+        except Exception as e:
+            error_msg = f"ERROR llamando {tool_name} en {server_url}: {e}"
+            self._log(server_label, f"{tool_name} {json.dumps(arguments)}", error_msg, error=True)
+            return error_msg
 
     async def _with_filesystem(self):
         try:
@@ -283,6 +323,14 @@ class ChatbotMCP:
             return result
         return asyncio.run(run())
 
+    def temp_convert(self, value: float, unit: str) -> str:
+        return self._call_remote_tool(
+            self.temp_server_url, 
+            "MCP:temp-remote", 
+            "convert_temp", 
+            {"value": value, "unit": unit}
+        )
+
     
     def dispatch_nl_action(self, plan: dict) -> str:
         tool = (plan.get("tool") or "").strip()
@@ -300,6 +348,8 @@ class ChatbotMCP:
                 return self.qr_decode(args["image_path"])
             if tool == "external.call":
                 return self.external_call(args["server"], args["tool"], args.get("args", {}))
+            if tool == "temp.convert":
+                return self.temp_convert(args["value"], args["unit"])
             if tool == "chat":
                 return self.ask_llm(args.get("prompt",""))
         except Exception as e:
@@ -317,6 +367,10 @@ if __name__ == "__main__":
 
     bot = ChatbotMCP(api_key=api_key, model="claude-3-haiku-20240307")
     print("Escribe tu pregunta :)")
+    print("Comandos especiales:")
+    print("- 'temp_convert <valor> <unidad>': Convierte temperatura (ej: temp_convert 25 C)")
+    print("- 'log': Muestra el registro de actividad")
+    print("- 'salir': Termina el programa")
 
     try:
         while True:
@@ -337,6 +391,18 @@ if __name__ == "__main__":
                 if cmd == "demo_git" and len(parts) >= 2:
                     path = parts[1]
                     print(bot.demo_git_repo(path))
+                    continue
+
+                if cmd == "temp_convert" and len(parts) >= 3:
+                    try:
+                        value = float(parts[1])
+                        unit = parts[2].upper()
+                        if unit not in ["C", "F"]:
+                            print("Error: La unidad debe ser 'C' (Celsius) o 'F' (Fahrenheit)")
+                            continue
+                        print(bot.temp_convert(value, unit))
+                    except ValueError:
+                        print("Error: El valor debe ser un número")
                     continue
 
                 if cmd == "qr_url" and len(parts) >= 2:
