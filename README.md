@@ -1,4 +1,4 @@
-# Servidor remoto de conversión de temperatura (Flask) + Chatbot
+# Servidor remoto
 
 Publica un **servidor HTTP (Flask)** con una herramienta de **conversión de temperatura** (Celsius ↔ Fahrenheit) y un **chatbot** que lo consume vía **JSON-RPC 2.0**. Incluye endpoints de **healthcheck** para **Google App Engine**, ejemplos con **cURL/Postman** y cómo conectar el **chatbot**.
 
